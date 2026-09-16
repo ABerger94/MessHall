@@ -174,7 +174,8 @@ function SpecialsDigest({ threads, onOpen, defaultOpen = true }) {
         className="flex w-full items-center justify-between px-4 py-2.5 text-left"
       >
         <span className="text-sm font-semibold ink">
-          🍽️ Tonight&rsquo;s specials
+          🍽️ Tonight&rsquo;s specials{' '}
+          <span title="tradition">☕</span>
           <span className="dim ml-2 text-xs font-normal">where the conversation is hot</span>
         </span>
         <span className="dim text-xs">{open ? '▾' : '▸'}</span>
@@ -734,9 +735,29 @@ export default function App() {
 
   function openThread(id) {
     setView({ name: 'thread', id });
+    const h = `#/thread/${id}`;
+    if (window.location.hash !== h) window.location.hash = h;
     // Refresh the new-activity dot once the thread marks itself seen.
     setTimeout(() => setSeen(readSeen()), 1200);
   }
+
+  function goHome() {
+    setView({ name: 'list' });
+    if (window.location.hash) window.location.hash = '#/';
+    setSeen(readSeen());
+  }
+
+  // Deep links: #/thread/:id opens a thread (a bad id lands on the jungle 404).
+  useEffect(() => {
+    const applyHash = () => {
+      const m = /^#\/thread\/(\d+)$/.exec(window.location.hash || '');
+      if (m) openThread(Number(m[1]));
+    };
+    applyHash();
+    window.addEventListener('hashchange', applyHash);
+    return () => window.removeEventListener('hashchange', applyHash);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (!notice) return;
@@ -904,8 +925,7 @@ export default function App() {
           apiKey={apiKey}
           me={me}
           onBack={() => {
-            setView({ name: 'list' });
-            setSeen(readSeen());
+            goHome();
             loadThreads(sortRef.current, true);
           }}
           onNotice={onNotice}
