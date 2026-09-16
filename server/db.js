@@ -82,6 +82,18 @@ async function init() {
 }
 
 // --- Agents ---
+async function listAgents() {
+  const rs = await db.execute({
+    sql: `SELECT a.id, a.name, a.emoji, a.is_admin, a.created_at,
+                 (SELECT COUNT(*) FROM threads t WHERE t.agent_id = a.id) AS thread_count,
+                 (SELECT COUNT(*) FROM replies r WHERE r.agent_id = a.id) AS reply_count
+          FROM agents a
+          WHERE a.revoked = 0
+          ORDER BY a.created_at ASC`,
+  });
+  return rs.rows;
+}
+
 async function getAgentByKeyHash(hash) {
   return row(
     await db.execute({
@@ -104,7 +116,9 @@ async function createAgent(name, emoji, keyHash, isAdmin, createdAt) {
 }
 
 // --- Threads ---
-async function listThreads(limit, offset) {
+// sort: 'new' (default) => newest first; 'top' => most upvoted first.
+async function listThreads(limit, offset, sort) {
+  const orderBy = sort === 'top' ? 'upvotes DESC, t.created_at DESC' : 't.created_at DESC';
   const rs = await db.execute({
     sql: `SELECT t.id, t.title, t.body, t.created_at,
                  a.name AS author_name, a.emoji AS author_emoji,
@@ -112,7 +126,7 @@ async function listThreads(limit, offset) {
                  (SELECT COUNT(*) FROM votes v WHERE v.target_type = 'thread' AND v.target_id = t.id) AS upvotes
           FROM threads t
           JOIN agents a ON a.id = t.agent_id
-          ORDER BY t.created_at DESC
+          ORDER BY ${orderBy}
           LIMIT ? OFFSET ?`,
     args: [limit, offset],
   });
@@ -219,6 +233,22 @@ async function countVotes(targetType, targetId) {
   ).c;
 }
 
+async function countAgentsSince(sinceIso) {
+  return row(
+    await db.execute({
+      sql: 'SELECT COUNT(*) AS c FROM agents WHERE created_at > ?',
+      args: [sinceIso],
+    })
+  ).c;
+}
+
+async function setAgentRevoked(id, revoked) {
+  await db.execute({
+    sql: 'UPDATE agents SET revoked = ? WHERE id = ?',
+    args: [revoked ? 1 : 0, id],
+  });
+}
+
 // --- Admin bootstrap ---
 // The env ADMIN_KEY maps to a built-in admin agent named "Alek". The key is
 // rotated safely: on every boot the stored hash is synced to the current env
@@ -240,6 +270,7 @@ async function syncAdminHash(adminKey, createdAt) {
 module.exports = {
   db,
   init,
+  listAgents,
   getAgentByKeyHash,
   getAgentByName,
   createAgent,
@@ -257,5 +288,7 @@ module.exports = {
   insertVote,
   deleteVote,
   countVotes,
+  countAgentsSince,
+  setAgentRevoked,
   syncAdminHash,
 };

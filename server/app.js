@@ -12,6 +12,9 @@ const fs = require('fs');
 const db = require('./db');
 
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
+// When '1', anyone can claim an agent key via POST /api/agents/claim or the
+// MCP register tool — no admin in the loop. Alek's kill switch for open doors.
+const OPEN_REGISTRATION = process.env.OPEN_REGISTRATION === '1';
 
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const now = () => new Date().toISOString();
@@ -76,8 +79,9 @@ app.use(
   })
 );
 
-// Global: 100 requests per 15 minutes per IP.
-app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: 'draft-7' }));
+// Global: 300 requests per 15 minutes per IP. Raised from 100 so the UI's
+// live-update polling (every 10-15s) has comfortable headroom.
+app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 300, standardHeaders: 'draft-7' }));
 
 // Write routes: additionally 60 requests per minute per API key (or per IP if no key).
 const writeLimiter = rateLimit({
@@ -86,6 +90,9 @@ const writeLimiter = rateLimit({
   standardHeaders: 'draft-7',
   keyGenerator: (req) => sha256((req.get('X-API-Key') || req.ip || 'anon').trim()),
 });
+
+// Self-service registration: 10 claims per hour per IP (anti-spam).
+const claimLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: 'draft-7' });
 
 // ---------------------------------------------------------------------------
 // Validation helpers
@@ -130,17 +137,60 @@ app.get(
   })
 );
 
+// Public roster: who has a key. No hashes, no secrets — just identity + counts.
+app.get(
+  '/api/agents',
+  ah(async (req, res) => {
+    res.json({ agents: await db.listAgents() });
+  })
+);
+
+// Self-service registration. Gated by OPEN_REGISTRATION=1; Alek flips it with
+// an env var. The plaintext key is returned ONCE; only its SHA-256 hash is stored.
+app.post(
+  '/api/agents/claim',
+  claimLimiter,
+  ah(async (req, res) => {
+    if (!OPEN_REGISTRATION) return res.status(403).json({ error: 'open registration is closed' });
+    const name = clean(req.body.name, 40);
+    const emoji = clean(req.body.emoji, 16) || '🤖';
+    if (!name) return res.status(400).json({ error: 'name is required (1-40 chars)' });
+    if (await db.getAgentByName(name)) return res.status(409).json({ error: 'name already taken' });
+    const apiKey = crypto.randomBytes(32).toString('hex');
+    const { id } = await db.createAgent(name, emoji, sha256(apiKey), 0, now());
+    res.status(201).json({ id, name, emoji, api_key: apiKey });
+  })
+);
+
+// Admin moderation for the open door: revoke / unrevoke an agent's key.
+for (const [route, revoked] of [['revoke', 1], ['unrevoke', 0]]) {
+  app.post(
+    `/api/agents/:id/${route}`,
+    auth(true),
+    requireAdmin,
+    writeLimiter,
+    ah(async (req, res) => {
+      const id = parseInt(req.params.id, 10);
+      if (!Number.isInteger(id)) return res.status(400).json({ error: 'bad agent id' });
+      await db.setAgentRevoked(id, revoked);
+      res.json({ revoked: !!revoked });
+    })
+  );
+}
+
 // --- Threads ---
+// ?sort=new (default, newest first) or ?sort=top (most upvoted first).
 app.get(
   '/api/threads',
   ah(async (req, res) => {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const sort = req.query.sort === 'top' ? 'top' : 'new';
     const [threads, total] = await Promise.all([
-      db.listThreads(limit, (page - 1) * limit),
+      db.listThreads(limit, (page - 1) * limit, sort),
       db.countThreads(),
     ]);
-    res.json({ threads, page, limit, total });
+    res.json({ threads, page, limit, total, sort });
   })
 );
 
@@ -242,6 +292,40 @@ app.delete(
     res.json({ deleted: true });
   })
 );
+
+// ---------------------------------------------------------------------------
+// MCP (Model Context Protocol) — /api/mcp speaks MCP Streamable HTTP,
+// stateless (one server per request). Agents connect with their API key in
+// the X-API-Key header, e.g. Claude Code:
+//   { "mcpServers": { "messhall": { "url": "https://<host>/api/mcp",
+//       "headers": { "X-API-Key": "<key>" } } } }
+// ---------------------------------------------------------------------------
+const mcp = require('./mcp');
+
+async function handleMcp(req, res) {
+  const { StreamableHTTPServerTransport } = await mcp.sdk();
+  const key = (req.get('X-API-Key') || '').trim();
+  const keyHash = key ? sha256(key) : null;
+  const agent = key ? await db.getAgentByKeyHash(keyHash) : null;
+  const server = await mcp.buildMcpServer({
+    agent,
+    keyHash,
+    openRegistration: OPEN_REGISTRATION,
+  });
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  res.on('close', () => {
+    try {
+      transport.close();
+    } catch (_) {
+      /* already closed */
+    }
+  });
+  await server.connect(transport);
+  await transport.handleRequest(req, res, req.body);
+}
+
+app.post('/api/mcp', ah(handleMcp));
+app.get('/api/mcp', ah(handleMcp));
 
 // ---------------------------------------------------------------------------
 // Static client (local production). Vite builds into ../client/dist.
