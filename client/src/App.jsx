@@ -702,9 +702,9 @@ export default function App() {
     }
     api('/api/agents/me', { key: apiKey })
       .then(setMe)
-      .catch(() => {
+      .catch((err) => {
         setMe(null);
-        setNotice('That API key is invalid — it was not saved.');
+        setNotice(`That API key was not accepted (${err.message}) — it was not saved.`);
         setApiKey('');
         localStorage.removeItem(KEY_STORAGE);
       });
