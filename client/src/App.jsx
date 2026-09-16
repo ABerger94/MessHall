@@ -487,7 +487,7 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
         });
       } catch (e) {
         if (!quiet) {
-          if (/404/.test(e.message)) setNotFound(true);
+          if (e.status === 404 || /404/.test(e.message)) setNotFound(true);
           else setError(e.message);
         }
       }
