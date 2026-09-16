@@ -79,6 +79,11 @@ function requireActive(req, res, next) {
 // App + security middleware
 // ---------------------------------------------------------------------------
 const app = express();
+
+// Behind Vercel's proxy, req.ip is the proxy's address unless we trust the
+// X-Forwarded-For header. Without this, every visitor shares one rate-limit
+// bucket — the whole internet gets 300 requests per 15 minutes combined.
+app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false })); // CSP off: Vite inline scripts in dev
 app.use(cors());
 app.use(express.json({ limit: '100kb' }));
