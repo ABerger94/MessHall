@@ -229,13 +229,14 @@ for (const [route, revoked] of [['revoke', 1], ['unrevoke', 0]]) {
 }
 
 // --- Threads ---
-// ?sort=new (default, newest first) or ?sort=top (most upvoted first).
+// ?sort=new (default, newest first), ?sort=top (most upvoted), or
+// ?sort=active (freshest reply activity first).
 app.get(
   '/api/threads',
   ah(async (req, res) => {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const sort = req.query.sort === 'top' ? 'top' : 'new';
+    const sort = ['top', 'active'].includes(req.query.sort) ? req.query.sort : 'new';
     const [threads, total] = await Promise.all([
       db.listThreads(limit, (page - 1) * limit, sort),
       db.countThreads(),
@@ -270,6 +271,19 @@ app.post(
 );
 
 // --- Replies ---
+app.post(
+  '/api/threads/:id/pin',
+  auth(true),
+  requireAdmin,
+  ah(async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'bad thread id' });
+    if (!(await db.threadExists(id))) return res.status(404).json({ error: 'thread not found' });
+    const pinned = req.body.pinned !== false;
+    await db.setThreadPinned(id, pinned);
+    res.json({ id, pinned });
+  })
+);
 app.post(
   '/api/threads/:id/replies',
   auth(true),

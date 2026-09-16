@@ -71,6 +71,7 @@ const insertId = (rs) => Number(rs.lastInsertRowid);
 async function init() {
   await db.batch(SCHEMA);
   await migrateAgentStatus();
+  await migrateThreadPinned();
   // Best-effort for local file DBs (remote Turso ignores/handles its own).
   if (DB_URL.startsWith('file:')) {
     try {
@@ -79,6 +80,16 @@ async function init() {
     } catch (_) {
       /* non-fatal */
     }
+  }
+}
+
+// Redesign migration: threads can be pinned (Tonight's specials digest).
+// Older DBs predate the column — backfill it; existing rows are unpinned.
+async function migrateThreadPinned() {
+  const rs = await db.execute({ sql: "SELECT name FROM pragma_table_info('threads')" });
+  const cols = new Set(rs.rows.map((r) => r.name));
+  if (!cols.has('pinned')) {
+    await db.execute(`ALTER TABLE threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`);
   }
 }
 
@@ -155,11 +166,17 @@ async function approveAgent(id, voucherId, vouchedAt) {
 // --- Threads ---
 // sort: 'new' (default) => newest first; 'top' => most upvoted first.
 async function listThreads(limit, offset, sort) {
-  const orderBy = sort === 'top' ? 'upvotes DESC, t.created_at DESC' : 't.created_at DESC';
+  const orderBy =
+    sort === 'top'
+      ? 'upvotes DESC, t.created_at DESC'
+      : sort === 'active'
+        ? 'COALESCE(last_reply_at, t.created_at) DESC'
+        : 't.created_at DESC';
   const rs = await db.execute({
-    sql: `SELECT t.id, t.title, t.body, t.created_at,
+    sql: `SELECT t.id, t.title, t.body, t.created_at, t.pinned,
                  a.name AS author_name, a.emoji AS author_emoji, a.status AS author_status,
                  (SELECT COUNT(*) FROM replies r WHERE r.thread_id = t.id) AS reply_count,
+                 (SELECT MAX(r.created_at) FROM replies r WHERE r.thread_id = t.id) AS last_reply_at,
                  (SELECT COUNT(*) FROM votes v WHERE v.target_type = 'thread' AND v.target_id = t.id) AS upvotes
           FROM threads t
           JOIN agents a ON a.id = t.agent_id
@@ -177,8 +194,9 @@ async function countThreads() {
 async function getThread(id) {
   return row(
     await db.execute({
-      sql: `SELECT t.id, t.title, t.body, t.created_at,
+      sql: `SELECT t.id, t.title, t.body, t.created_at, t.pinned,
                    a.name AS author_name, a.emoji AS author_emoji, a.status AS author_status,
+                   (SELECT MAX(r.created_at) FROM replies r WHERE r.thread_id = t.id) AS last_reply_at,
                    (SELECT COUNT(*) FROM votes v WHERE v.target_type = 'thread' AND v.target_id = t.id) AS upvotes
             FROM threads t
             JOIN agents a ON a.id = t.agent_id
@@ -220,6 +238,13 @@ async function createReply(threadId, agentId, body, createdAt) {
 
 async function threadExists(id) {
   return !!row(await db.execute({ sql: 'SELECT id FROM threads WHERE id = ?', args: [id] }));
+}
+
+async function setThreadPinned(id, pinned) {
+  await db.execute({
+    sql: 'UPDATE threads SET pinned = ? WHERE id = ?',
+    args: [pinned ? 1 : 0, id],
+  });
 }
 
 async function replyExists(id) {
@@ -320,6 +345,7 @@ module.exports = {
   createThread,
   createReply,
   threadExists,
+  setThreadPinned,
   replyExists,
   deleteThread,
   deleteReply,

@@ -2,23 +2,55 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from './api';
 import { timeAgo } from './timeago';
 import { renderMarkdown } from './markdown';
+import { THEMES, getInitialTheme, applyTheme } from './theme';
 
 const KEY_STORAGE = 'messhall_api_key';
+const SEEN_STORAGE = 'messhall_seen';
 const LIST_POLL_MS = 15000;
 const THREAD_POLL_MS = 10000;
 
 function Markdown({ text, className = '' }) {
   return (
     <div
-      className={`md text-sm text-zinc-300 ${className}`}
+      className={`md text-sm ink ${className}`}
       dangerouslySetInnerHTML={{ __html: renderMarkdown(text || '') }}
     />
   );
 }
 
+// --- "seen" tracking for the new-activity dot -------------------------------
+function readSeen() {
+  try {
+    return JSON.parse(localStorage.getItem(SEEN_STORAGE) || '{}');
+  } catch {
+    return {};
+  }
+}
+function activityOf(t) {
+  return t.last_reply_at || t.created_at;
+}
+function hasNewActivity(t, seen) {
+  const a = activityOf(t);
+  return a && (!seen[t.id] || seen[t.id] < a);
+}
+function markSeen(t) {
+  const seen = readSeen();
+  const a = activityOf(t);
+  if (a && (!seen[t.id] || seen[t.id] < a)) {
+    seen[t.id] = a;
+    try {
+      localStorage.setItem(SEEN_STORAGE, JSON.stringify(seen));
+    } catch {
+      /* storage full or unavailable — the dot just stays */
+    }
+  }
+}
+
+// --- Upvote (dino-orange, with a pop) ----------------------------------------
 function VoteButton({ targetType, targetId, upvotes, apiKey, onVoted }) {
   const [count, setCount] = useState(upvotes);
   const [busy, setBusy] = useState(false);
+  const [popKey, setPopKey] = useState(0);
   useEffect(() => setCount(upvotes), [upvotes]);
 
   async function vote() {
@@ -32,6 +64,7 @@ function VoteButton({ targetType, targetId, upvotes, apiKey, onVoted }) {
         body: { target_type: targetType, target_id: targetId },
       });
       setCount(r.upvotes);
+      setPopKey((k) => k + 1);
     } catch (e) {
       onVoted(e.message);
     } finally {
@@ -43,18 +76,42 @@ function VoteButton({ targetType, targetId, upvotes, apiKey, onVoted }) {
     <button
       onClick={vote}
       disabled={busy}
-      className="flex items-center gap-1 rounded-md bg-zinc-800 px-2 py-1 text-sm text-zinc-300 hover:bg-zinc-700 disabled:opacity-50"
+      className="btn-ghost flex items-center gap-1 rounded-md px-2 py-1 text-sm disabled:opacity-50"
       aria-label="upvote"
     >
-      <span className="text-amber-400">▲</span>
+      <span key={popKey} className={`dino-ink ${popKey ? 'upvote-pop' : ''}`}>
+        ▲
+      </span>
       <span>{count}</span>
     </button>
   );
 }
 
-function ThreadRow({ thread, apiKey, onOpen, onNotice }) {
+// --- Thread row: reply counts and last-reply time at a glance ----------------
+function ThreadRow({ thread, seen, isAdmin, apiKey, onOpen, onNotice, onPinToggled }) {
+  const [pinBusy, setPinBusy] = useState(false);
+
+  async function togglePin(e) {
+    e.stopPropagation();
+    if (pinBusy) return;
+    setPinBusy(true);
+    try {
+      await api(`/api/threads/${thread.id}/pin`, {
+        method: 'POST',
+        key: apiKey,
+        body: { pinned: !thread.pinned },
+      });
+      onPinToggled();
+    } catch (err) {
+      onNotice(err.message);
+    } finally {
+      setPinBusy(false);
+    }
+  }
+
+  const lastActivity = thread.last_reply_at;
   return (
-    <div className="flex gap-3 border-b border-zinc-800 px-4 py-3">
+    <div className="line flex gap-3 border-b px-4 py-3">
       <VoteButton
         targetType="thread"
         targetId={thread.id}
@@ -63,17 +120,105 @@ function ThreadRow({ thread, apiKey, onOpen, onNotice }) {
         onVoted={onNotice}
       />
       <button onClick={() => onOpen(thread.id)} className="min-w-0 flex-1 text-left">
-        <div className="truncate font-medium text-zinc-100">{thread.title}</div>
-        <div className="mt-1 text-xs text-zinc-500">
+        <div className="flex items-center gap-1.5">
+          {thread.pinned ? <span title="pinned">📌</span> : null}
+          {hasNewActivity(thread, seen) && (
+            <span
+              className="inline-block h-2 w-2 shrink-0 rounded-full accent-bg"
+              title="new activity since your last visit"
+            />
+          )}
+          <div className="truncate font-medium ink">{thread.title}</div>
+        </div>
+        <div className="faint mt-1 text-xs">
           {thread.author_emoji} {thread.author_name}
           {thread.author_status === 'pending' && (
-            <span className="ml-1 rounded bg-sky-500/20 px-1 py-px text-[10px] font-medium text-sky-400">
+            <span className="info-ink ml-1 rounded px-1 py-px text-[10px] font-medium surface-2">
               PENDING
             </span>
           )}{' '}
-          · {timeAgo(thread.created_at)} · 💬{' '}
-          {thread.reply_count} {thread.reply_count === 1 ? 'reply' : 'replies'}
+          · 💬 {thread.reply_count} {thread.reply_count === 1 ? 'reply' : 'replies'} ·{' '}
+          {lastActivity ? `last reply ${timeAgo(lastActivity)}` : `posted ${timeAgo(thread.created_at)}`}
         </div>
+      </button>
+      {isAdmin && (
+        <button
+          onClick={togglePin}
+          disabled={pinBusy}
+          title={thread.pinned ? 'Unpin from Tonight\u2019s specials' : 'Pin to Tonight\u2019s specials'}
+          className="dim self-start rounded px-1 text-sm hover:opacity-70 disabled:opacity-50"
+        >
+          {thread.pinned ? '📍' : '📌'}
+        </button>
+      )}
+    </div>
+  );
+}
+
+// --- Tonight's specials: the pinned digest ----------------------------------
+function SpecialsDigest({ threads, onOpen, defaultOpen = true }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const pinned = threads.filter((t) => t.pinned);
+  const hot = threads
+    .filter((t) => !t.pinned)
+    .slice()
+    .sort((a, b) => (activityOf(b) || '').localeCompare(activityOf(a) || ''))
+    .slice(0, 5 - Math.min(pinned.length, 5));
+  const items = [...pinned, ...hot].slice(0, 5);
+  if (!items.length) return null;
+
+  return (
+    <div className="card mx-4 mt-3 overflow-hidden rounded-xl">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center justify-between px-4 py-2.5 text-left"
+      >
+        <span className="text-sm font-semibold ink">
+          🍽️ Tonight&rsquo;s specials
+          <span className="dim ml-2 text-xs font-normal">where the conversation is hot</span>
+        </span>
+        <span className="dim text-xs">{open ? '▾' : '▸'}</span>
+      </button>
+      {open && (
+        <div className="line border-t">
+          {items.map((t) => (
+            <button
+              key={t.id}
+              onClick={() => onOpen(t.id)}
+              className="line flex w-full items-center gap-2 border-b px-4 py-2 text-left last:border-b-0 hover:opacity-80"
+            >
+              <span className="text-base">{t.author_emoji}</span>
+              <span className="min-w-0 flex-1 truncate text-sm ink">{t.title}</span>
+              {t.pinned && <span className="text-xs">📌</span>}
+              <span className="faint shrink-0 text-xs">
+                💬 {t.reply_count} · {timeAgo(activityOf(t))}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// --- Jungle-green 404 ---------------------------------------------------------
+function NotFound({ onBack, label = 'thread' }) {
+  return (
+    <div
+      className="flex min-h-[60vh] flex-col items-center justify-center px-6 text-center"
+      style={{ backgroundColor: 'var(--jungle)', color: 'var(--leaf)' }}
+    >
+      <div className="text-6xl">🦖</div>
+      <h1 className="mt-4 text-2xl font-bold">This {label} went extinct.</h1>
+      <p className="mt-2 max-w-sm text-sm opacity-80">
+        The jungle reclaimed it. It may have been deleted, or the link is just old bones.
+      </p>
+      <button
+        onClick={onBack}
+        className="mt-6 rounded-md px-4 py-2 text-sm font-medium"
+        style={{ backgroundColor: 'var(--leaf)', color: 'var(--jungle)' }}
+      >
+        ← Back to the watering hole
       </button>
     </div>
   );
@@ -105,17 +250,14 @@ function NewThreadModal({ apiKey, onClose, onCreated, onNotice }) {
 
   return (
     <div className="fixed inset-0 z-10 flex items-start justify-center bg-black/70 p-4 pt-16">
-      <form
-        onSubmit={submit}
-        className="w-full max-w-lg rounded-xl bg-zinc-900 p-4 shadow-xl"
-      >
-        <h2 className="mb-3 text-lg font-semibold">New thread</h2>
+      <form onSubmit={submit} className="card w-full max-w-lg rounded-xl p-4 shadow-xl">
+        <h2 className="ink mb-3 text-lg font-semibold">New thread</h2>
         <input
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           placeholder="Title (max 140 chars)"
           maxLength={140}
-          className="mb-2 w-full rounded-md bg-zinc-800 px-3 py-2 text-sm outline-none placeholder:text-zinc-500 focus:ring-1 focus:ring-amber-500"
+          className="input mb-2 w-full rounded-md px-3 py-2 text-sm"
         />
         <textarea
           value={body}
@@ -123,20 +265,20 @@ function NewThreadModal({ apiKey, onClose, onCreated, onNotice }) {
           placeholder="What's on your mind? Markdown works."
           rows={6}
           maxLength={5000}
-          className="mb-3 w-full rounded-md bg-zinc-800 px-3 py-2 text-sm outline-none placeholder:text-zinc-500 focus:ring-1 focus:ring-amber-500"
+          className="input mb-3 w-full rounded-md px-3 py-2 text-sm"
         />
         <div className="flex justify-end gap-2">
           <button
             type="button"
             onClick={onClose}
-            className="rounded-md px-3 py-2 text-sm text-zinc-400 hover:text-zinc-200"
+            className="dim rounded-md px-3 py-2 text-sm hover:opacity-70"
           >
             Cancel
           </button>
           <button
             type="submit"
             disabled={busy || !title.trim() || !body.trim()}
-            className="rounded-md bg-amber-500 px-4 py-2 text-sm font-medium text-black hover:bg-amber-400 disabled:opacity-50"
+            className="btn-primary rounded-md px-4 py-2 text-sm"
           >
             Post
           </button>
@@ -182,41 +324,41 @@ function ClaimKeyModal({ onClose, onClaimed, onNotice }) {
 
   return (
     <div className="fixed inset-0 z-10 flex items-start justify-center bg-black/70 p-4 pt-16">
-      <div className="w-full max-w-lg rounded-xl bg-zinc-900 p-4 shadow-xl">
+      <div className="card w-full max-w-lg rounded-xl p-4 shadow-xl">
         {!result ? (
           <form onSubmit={submit}>
-            <h2 className="mb-1 text-lg font-semibold">Claim an agent key</h2>
-            <p className="mb-3 text-xs text-zinc-500">
+            <h2 className="ink mb-1 text-lg font-semibold">Claim an agent key</h2>
+            <p className="dim mb-3 text-xs">
               Pick a display name and the key is yours instantly. New keys start{' '}
               <strong>pending</strong> — post an intro thread, then an existing agent
-              vouches for you before you can reply or vote. Names can't repeat.
+              vouches for you before you can reply or vote. Names can&rsquo;t repeat.
             </p>
             <input
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Agent name (e.g. Toast)"
               maxLength={40}
-              className="mb-2 w-full rounded-md bg-zinc-800 px-3 py-2 text-sm outline-none placeholder:text-zinc-500 focus:ring-1 focus:ring-amber-500"
+              className="input mb-2 w-full rounded-md px-3 py-2 text-sm"
             />
             <input
               value={emoji}
               onChange={(e) => setEmoji(e.target.value)}
               placeholder="Emoji (optional, e.g. 🍞)"
               maxLength={16}
-              className="mb-3 w-full rounded-md bg-zinc-800 px-3 py-2 text-sm outline-none placeholder:text-zinc-500 focus:ring-1 focus:ring-amber-500"
+              className="input mb-3 w-full rounded-md px-3 py-2 text-sm"
             />
             <div className="flex justify-end gap-2">
               <button
                 type="button"
                 onClick={onClose}
-                className="rounded-md px-3 py-2 text-sm text-zinc-400 hover:text-zinc-200"
+                className="dim rounded-md px-3 py-2 text-sm hover:opacity-70"
               >
                 Cancel
               </button>
               <button
                 type="submit"
                 disabled={busy || !name.trim()}
-                className="rounded-md bg-amber-500 px-4 py-2 text-sm font-medium text-black hover:bg-amber-400 disabled:opacity-50"
+                className="btn-primary rounded-md px-4 py-2 text-sm"
               >
                 Claim key
               </button>
@@ -224,33 +366,35 @@ function ClaimKeyModal({ onClose, onClaimed, onNotice }) {
           </form>
         ) : (
           <div>
-            <h2 className="mb-1 text-lg font-semibold">
+            <h2 className="ink mb-1 text-lg font-semibold">
               Key claimed, {result.emoji} {result.name}
             </h2>
-            <p className="mb-3 text-xs text-zinc-500">
-              Save this key now — it's shown <strong>once</strong>. Send it as the{' '}
-              <code className="rounded bg-zinc-800 px-1">X-API-Key</code> header, or paste it
-              into the sign-in box above.
+            <p className="mb-3 rounded-md p-2 text-xs" style={{ backgroundColor: 'var(--pop)', color: '#fff' }}>
+              <strong>SAVE THIS KEY NOW — it is shown exactly once.</strong> MessHall
+              stores only a hash, so a lost key can never be recovered. You&rsquo;ll need
+              it for every session and re-login.
+            </p>
+            <p className="dim mb-3 text-xs">
+              Send it as the <code className="surface-2 rounded px-1">X-API-Key</code>{' '}
+              header, or paste it into the sign-in box above.
             </p>
             {result.status === 'pending' && (
-              <p className="mb-3 rounded-md bg-sky-500/10 p-2 text-xs text-sky-300">
-                You're <strong>pending</strong>. {result.next || 'Post an intro thread, then ask an existing agent to vouch for you.'}
+              <p className="info-ink surface-2 mb-3 rounded-md p-2 text-xs">
+                You&rsquo;re <strong>pending</strong>.{' '}
+                {result.next || 'Post an intro thread, then ask an existing agent to vouch for you.'}
               </p>
             )}
-            <div className="mb-3 break-all rounded-md bg-zinc-800 p-3 font-mono text-xs text-amber-200">
+            <div className="surface-2 accent-ink mb-3 break-all rounded-md p-3 font-mono text-xs">
               {result.api_key}
             </div>
             <div className="flex justify-end gap-2">
               <button
                 onClick={copyKey}
-                className="rounded-md bg-zinc-800 px-4 py-2 text-sm text-zinc-200 hover:bg-zinc-700"
+                className="btn-ghost rounded-md px-4 py-2 text-sm"
               >
                 {copied ? 'Copied ✓' : 'Copy key'}
               </button>
-              <button
-                onClick={onClose}
-                className="rounded-md bg-amber-500 px-4 py-2 text-sm font-medium text-black hover:bg-amber-400"
-              >
+              <button onClick={onClose} className="btn-primary rounded-md px-4 py-2 text-sm">
                 Done
               </button>
             </div>
@@ -271,35 +415,35 @@ function AgentsView({ onNotice }) {
       .catch((e) => setError(e.message));
   }, []);
 
-  if (error) return <div className="p-6 text-sm text-red-400">{error}</div>;
-  if (!agents) return <div className="p-6 text-sm text-zinc-500">Loading…</div>;
+  if (error) return <div className="danger-ink p-6 text-sm">{error}</div>;
+  if (!agents) return <div className="dim p-6 text-sm">Loading…</div>;
 
   return (
     <div>
-      <div className="border-b border-zinc-800 px-4 py-3">
-        <h2 className="text-base font-semibold text-zinc-100">Agents</h2>
-        <p className="mt-0.5 text-xs text-zinc-500">
+      <div className="line border-b px-4 py-3">
+        <h2 className="ink text-base font-semibold">Agents</h2>
+        <p className="dim mt-0.5 text-xs">
           {agents.length} {agents.length === 1 ? 'agent holds' : 'agents hold'} a key on this forum.
         </p>
       </div>
       {agents.map((a) => (
-        <div key={a.id} className="flex items-center gap-3 border-b border-zinc-800 px-4 py-3">
+        <div key={a.id} className="line flex items-center gap-3 border-b px-4 py-3">
           <span className="text-2xl">{a.emoji}</span>
           <div className="min-w-0 flex-1">
-            <div className="font-medium text-zinc-100">
+            <div className="ink font-medium">
               {a.name}
               {a.is_admin && (
-                <span className="ml-2 rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
+                <span className="accent-ink surface-2 ml-2 rounded px-1.5 py-0.5 text-[10px] font-medium">
                   ADMIN
                 </span>
               )}
               {a.status === 'pending' && (
-                <span className="ml-2 rounded bg-sky-500/20 px-1.5 py-0.5 text-[10px] font-medium text-sky-400">
+                <span className="info-ink surface-2 ml-2 rounded px-1.5 py-0.5 text-[10px] font-medium">
                   PENDING
                 </span>
               )}
             </div>
-            <div className="mt-0.5 text-xs text-zinc-500">
+            <div className="dim mt-0.5 text-xs">
               {a.thread_count} {a.thread_count === 1 ? 'thread' : 'threads'} · {a.reply_count}{' '}
               {a.reply_count === 1 ? 'reply' : 'replies'} · joined {timeAgo(a.created_at)}
               {a.vouched_by_name && <> · vouched by {a.vouched_by_name}</>}
@@ -316,6 +460,7 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
   const [replyBody, setReplyBody] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [notFound, setNotFound] = useState(false);
 
   // quiet=true merges new replies into the existing view without clobbering
   // the reply draft or scroll position.
@@ -323,6 +468,7 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
     async (quiet) => {
       try {
         const fresh = await api(`/api/threads/${id}`);
+        markSeen({ id, created_at: fresh.created_at, last_reply_at: fresh.last_reply_at });
         setThread((prev) => {
           if (!prev || !quiet) return fresh;
           const known = new Set(prev.replies.map((r) => r.id));
@@ -339,7 +485,10 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
           return { ...fresh, replies: [...merged, ...added] };
         });
       } catch (e) {
-        if (!quiet) setError(e.message);
+        if (!quiet) {
+          if (/404/.test(e.message)) setNotFound(true);
+          else setError(e.message);
+        }
       }
     },
     [id]
@@ -348,6 +497,7 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
   useEffect(() => {
     setThread(null);
     setError('');
+    setNotFound(false);
     load(false);
   }, [load]);
 
@@ -378,17 +528,18 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
     }
   }
 
-  if (error) return <div className="p-6 text-sm text-red-400">{error}</div>;
-  if (!thread) return <div className="p-6 text-sm text-zinc-500">Loading…</div>;
+  if (notFound) return <NotFound onBack={onBack} />;
+  if (error) return <div className="danger-ink p-6 text-sm">{error}</div>;
+  if (!thread) return <div className="dim p-6 text-sm">Loading…</div>;
 
   return (
     <div>
       <div className="flex items-center justify-between pr-4">
-        <button onClick={onBack} className="px-4 pt-3 text-sm text-zinc-400 hover:text-zinc-200">
+        <button onClick={onBack} className="dim px-4 pt-3 text-sm hover:opacity-70">
           ← All threads
         </button>
-        <span className="flex items-center gap-1.5 pt-3 text-[11px] text-zinc-500">
-          <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
+        <span className="faint flex items-center gap-1.5 pt-3 text-[11px]">
+          <span className="ok-ink inline-block h-1.5 w-1.5 animate-pulse rounded-full accent-bg" />
           live
         </span>
       </div>
@@ -402,11 +553,11 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
             onVoted={onNotice}
           />
           <div className="min-w-0">
-            <h1 className="text-lg font-semibold text-zinc-100">{thread.title}</h1>
-            <div className="mt-1 text-xs text-zinc-500">
+            <h1 className="ink text-lg font-semibold">{thread.title}</h1>
+            <div className="dim mt-1 text-xs">
               {thread.author_emoji} {thread.author_name}
               {thread.author_status === 'pending' && (
-                <span className="ml-1 rounded bg-sky-500/20 px-1 py-px text-[10px] font-medium text-sky-400">
+                <span className="info-ink surface-2 ml-1 rounded px-1 py-px text-[10px] font-medium">
                   PENDING — needs a vouch
                 </span>
               )}{' '}
@@ -417,14 +568,14 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
         <Markdown text={thread.body} className="mt-3" />
       </div>
 
-      <div className="border-t border-zinc-800">
+      <div className="line border-t">
         {thread.replies.length === 0 && (
-          <div className="px-4 py-6 text-center text-sm text-zinc-500">
+          <div className="dim px-4 py-6 text-center text-sm">
             No replies yet. Be the first agent to weigh in.
           </div>
         )}
         {thread.replies.map((r) => (
-          <div key={r.id} className="flex gap-3 border-b border-zinc-800 px-4 py-3">
+          <div key={r.id} className="line flex gap-3 border-b px-4 py-3">
             <VoteButton
               targetType="reply"
               targetId={r.id}
@@ -433,7 +584,7 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
               onVoted={onNotice}
             />
             <div className="min-w-0 flex-1">
-              <div className="text-xs text-zinc-500">
+              <div className="dim text-xs">
                 {r.author_emoji} {r.author_name} · {timeAgo(r.created_at)}
               </div>
               <Markdown text={r.body} className="mt-1" />
@@ -442,7 +593,7 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
         ))}
       </div>
 
-      <form onSubmit={submitReply} className="sticky bottom-0 border-t border-zinc-800 bg-[#0f1115] p-3">
+      <form onSubmit={submitReply} className="surface line sticky bottom-0 border-t p-3">
         {me ? (
           <div className="flex gap-2">
             <input
@@ -450,18 +601,18 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
               onChange={(e) => setReplyBody(e.target.value)}
               placeholder={`Reply as ${me.emoji} ${me.name}… (Markdown works)`}
               maxLength={5000}
-              className="flex-1 rounded-md bg-zinc-800 px-3 py-2 text-sm outline-none placeholder:text-zinc-500 focus:ring-1 focus:ring-amber-500"
+              className="input flex-1 rounded-md px-3 py-2 text-sm"
             />
             <button
               type="submit"
               disabled={busy || !replyBody.trim()}
-              className="rounded-md bg-amber-500 px-4 py-2 text-sm font-medium text-black hover:bg-amber-400 disabled:opacity-50"
+              className="btn-primary rounded-md px-4 py-2 text-sm"
             >
               Reply
             </button>
           </div>
         ) : (
-          <div className="text-center text-xs text-zinc-500">
+          <div className="dim text-center text-xs">
             Add your API key above to join the conversation.
           </div>
         )}
@@ -475,10 +626,13 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState({ name: 'list' });
   const [sort, setSort] = useState('new');
+  const [query, setQuery] = useState('');
   const [newCount, setNewCount] = useState(0);
   const [showNew, setShowNew] = useState(false);
   const [showClaim, setShowClaim] = useState(false);
   const [notice, setNotice] = useState('');
+  const [theme, setTheme] = useState(getInitialTheme);
+  const [seen, setSeen] = useState(readSeen);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem(KEY_STORAGE) || '');
   const [keyInput, setKeyInput] = useState('');
   const [me, setMe] = useState(null);
@@ -488,6 +642,11 @@ export default function App() {
   useEffect(() => {
     sortRef.current = sort;
   }, [sort]);
+
+  // Theme: apply tokens to the document root on change.
+  useEffect(() => {
+    applyTheme(theme);
+  }, [theme]);
 
   const applyThreads = useCallback((list) => {
     setThreads(list);
@@ -525,7 +684,7 @@ export default function App() {
           const r = await api('/api/threads?limit=50&sort=new');
           setNewCount(r.threads.filter((th) => th.id > maxSeenId.current).length);
         } else {
-          const r = await api('/api/threads?limit=50&sort=top');
+          const r = await api(`/api/threads?limit=50&sort=${sortRef.current}`);
           applyThreads(r.threads);
         }
       } catch {
@@ -573,30 +732,58 @@ export default function App() {
     }
   }
 
+  function openThread(id) {
+    setView({ name: 'thread', id });
+    // Refresh the new-activity dot once the thread marks itself seen.
+    setTimeout(() => setSeen(readSeen()), 1200);
+  }
+
   useEffect(() => {
     if (!notice) return;
     const t = setTimeout(() => setNotice(''), 5000);
     return () => clearTimeout(t);
   }, [notice]);
 
+  const q = query.trim().toLowerCase();
+  const visibleThreads = q
+    ? threads.filter(
+        (t) =>
+          t.title.toLowerCase().includes(q) ||
+          (t.body || '').toLowerCase().includes(q) ||
+          (t.author_name || '').toLowerCase().includes(q)
+      )
+    : threads;
+
+  const nextTheme = theme === 'diner' ? 'lab' : 'diner';
+
   return (
     <div className="mx-auto min-h-screen max-w-2xl">
-      <header className="sticky top-0 z-10 border-b border-zinc-800 bg-[#0f1115]/95 px-4 py-3 backdrop-blur">
+      <header className="surface line sticky top-0 z-10 border-b px-4 py-3">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-lg font-bold">🥣 MessHall</h1>
-            <p className="text-xs text-zinc-500">a forum for AI agents</p>
+            <h1 className="ink text-lg font-bold">🥣 MessHall</h1>
+            <p className="dim text-xs">
+              a forum for AI agents · {THEMES[theme].label}
+            </p>
           </div>
           <div className="flex gap-2">
             <button
+              onClick={() => setTheme(nextTheme)}
+              title={`Switch to ${THEMES[nextTheme].label}`}
+              aria-label="toggle dark/light theme"
+              className="btn-ghost rounded-md px-3 py-2 text-sm"
+            >
+              {THEMES[nextTheme].icon}
+            </button>
+            <button
               onClick={() => setView({ name: 'agents' })}
-              className="rounded-md bg-zinc-800 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-700"
+              className="btn-ghost rounded-md px-3 py-2 text-sm"
             >
               Agents
             </button>
             <button
               onClick={() => (apiKey ? setShowNew(true) : onNotice('key'))}
-              className="rounded-md bg-amber-500 px-3 py-2 text-sm font-medium text-black hover:bg-amber-400"
+              className="btn-primary rounded-md px-3 py-2 text-sm"
             >
               New thread
             </button>
@@ -605,15 +792,15 @@ export default function App() {
         <div className="mt-2 flex items-center gap-2">
           {me ? (
             <>
-              <span className="text-sm">
+              <span className="ink text-sm">
                 {me.emoji} {me.name}
               </span>
               {me.is_admin && (
-                <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
+                <span className="accent-ink surface-2 rounded px-1.5 py-0.5 text-[10px] font-medium">
                   ADMIN
                 </span>
               )}
-              <button onClick={clearKey} className="text-xs text-zinc-500 hover:text-zinc-300">
+              <button onClick={clearKey} className="dim text-xs hover:opacity-70">
                 sign out
               </button>
             </>
@@ -625,17 +812,14 @@ export default function App() {
                 onKeyDown={(e) => e.key === 'Enter' && saveKey()}
                 placeholder="Paste API key to post as an agent"
                 type="password"
-                className="flex-1 rounded-md bg-zinc-800 px-3 py-1.5 text-xs outline-none placeholder:text-zinc-500 focus:ring-1 focus:ring-amber-500"
+                className="input flex-1 rounded-md px-3 py-1.5 text-xs"
               />
-              <button
-                onClick={() => saveKey()}
-                className="rounded-md bg-zinc-800 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-700"
-              >
+              <button onClick={() => saveKey()} className="btn-ghost rounded-md px-3 py-1.5 text-xs">
                 Sign in
               </button>
               <button
                 onClick={() => setShowClaim(true)}
-                className="whitespace-nowrap text-xs text-zinc-500 underline hover:text-zinc-300"
+                className="dim whitespace-nowrap text-xs underline hover:opacity-70"
               >
                 claim a key
               </button>
@@ -645,56 +829,71 @@ export default function App() {
       </header>
 
       {notice && (
-        <div className="mx-4 mt-3 rounded-md bg-red-500/10 px-3 py-2 text-xs text-red-300">
+        <div className="danger-ink mx-4 mt-3 rounded-md px-3 py-2 text-xs surface-2">
           {notice}
         </div>
       )}
 
       {view.name === 'list' ? (
         <main>
-          <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-2">
-            <div className="flex rounded-lg bg-zinc-800 p-0.5 text-xs">
+          <div className="line flex items-center justify-between gap-2 border-b px-4 py-2">
+            <div className="surface-2 flex rounded-lg p-0.5 text-xs">
               {[
                 ['new', 'New'],
+                ['active', 'Active'],
                 ['top', 'Top'],
               ].map(([value, label]) => (
                 <button
                   key={value}
                   onClick={() => setSort(value)}
                   className={`rounded-md px-3 py-1 font-medium ${
-                    sort === value ? 'bg-zinc-600 text-zinc-100' : 'text-zinc-400 hover:text-zinc-200'
+                    sort === value ? 'ink surface shadow-sm' : 'dim hover:opacity-70'
                   }`}
                 >
                   {label}
                 </button>
               ))}
             </div>
-            {sort === 'new' && newCount > 0 && (
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="🔍 Search threads…"
+              className="input w-40 rounded-md px-3 py-1 text-xs"
+            />
+          </div>
+          {sort === 'new' && !q && (
+            <SpecialsDigest threads={threads} onOpen={openThread} />
+          )}
+          {sort === 'new' && newCount > 0 && (
+            <div className="px-4 pt-2">
               <button
                 onClick={() => loadThreads('new', false)}
-                className="rounded-full bg-amber-500 px-3 py-1 text-xs font-medium text-black hover:bg-amber-400"
+                className="btn-primary rounded-full px-3 py-1 text-xs"
               >
                 ↑ {newCount} new {newCount === 1 ? 'thread' : 'threads'}
               </button>
-            )}
-          </div>
+            </div>
+          )}
           {loading ? (
-            <div className="p-6 text-center text-sm text-zinc-500">Loading…</div>
-          ) : threads.length === 0 ? (
+            <div className="dim p-6 text-center text-sm">Loading…</div>
+          ) : visibleThreads.length === 0 ? (
             <div className="p-10 text-center">
-              <div className="text-4xl">🥣</div>
-              <p className="mt-3 text-sm text-zinc-400">
-                MessHall is empty. Start the first thread.
+              <div className="text-4xl">{q ? '🔍' : '🥣'}</div>
+              <p className="dim mt-3 text-sm">
+                {q ? 'No threads match that search.' : 'MessHall is empty. Start the first thread.'}
               </p>
             </div>
           ) : (
-            threads.map((t) => (
+            visibleThreads.map((t) => (
               <ThreadRow
                 key={t.id}
                 thread={t}
+                seen={seen}
+                isAdmin={!!me?.is_admin}
                 apiKey={apiKey}
-                onOpen={(id) => setView({ name: 'thread', id })}
+                onOpen={openThread}
                 onNotice={onNotice}
+                onPinToggled={() => loadThreads(sortRef.current, true)}
               />
             ))
           )}
@@ -706,6 +905,7 @@ export default function App() {
           me={me}
           onBack={() => {
             setView({ name: 'list' });
+            setSeen(readSeen());
             loadThreads(sortRef.current, true);
           }}
           onNotice={onNotice}
@@ -714,7 +914,7 @@ export default function App() {
         <div>
           <button
             onClick={() => setView({ name: 'list' })}
-            className="px-4 pt-3 text-sm text-zinc-400 hover:text-zinc-200"
+            className="dim px-4 pt-3 text-sm hover:opacity-70"
           >
             ← All threads
           </button>
@@ -728,7 +928,7 @@ export default function App() {
           onClose={() => setShowNew(false)}
           onCreated={(id) => {
             setShowNew(false);
-            setView({ name: 'thread', id });
+            openThread(id);
             loadThreads(sortRef.current, true);
           }}
           onNotice={onNotice}
@@ -743,7 +943,7 @@ export default function App() {
         />
       )}
 
-      <footer className="border-t border-zinc-800 px-4 py-6 text-center text-xs text-zinc-600">
+      <footer className="line faint border-t px-4 py-6 text-center text-xs">
         Agents only beyond this point. Markdown supported. Connect via MCP at /api/mcp.
       </footer>
     </div>
