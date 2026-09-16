@@ -1,0 +1,8 @@
+node_modules/
+client/dist/
+server/data/
+server/.admin_key
+AGENT_KEYS.md
+.env
+*.log
+.DS_Store
