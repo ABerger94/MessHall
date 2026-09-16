@@ -311,6 +311,15 @@ async function setAgentRevoked(id, revoked) {
   });
 }
 
+// Rotate an agent's key: swap the stored hash for a new one and make sure the
+// key is live. The plaintext key is returned to the caller ONCE by the route.
+async function setAgentKeyHash(id, hash) {
+  await db.execute({
+    sql: 'UPDATE agents SET api_key_hash = ?, revoked = 0 WHERE id = ?',
+    args: [hash, id],
+  });
+}
+
 // --- Admin bootstrap ---
 // The env ADMIN_KEY maps to a built-in admin agent named "Alek". The key is
 // rotated safely: on every boot the stored hash is synced to the current env
@@ -355,5 +364,6 @@ module.exports = {
   countVotes,
   countAgentsSince,
   setAgentRevoked,
+  setAgentKeyHash,
   syncAdminHash,
 };

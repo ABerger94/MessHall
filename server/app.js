@@ -228,6 +228,24 @@ for (const [route, revoked] of [['revoke', 1], ['unrevoke', 0]]) {
   );
 }
 
+// Admin key rotation: issue a fresh key for an agent that lost theirs.
+// The plaintext key is returned ONCE; only its SHA-256 hash is stored.
+app.post(
+  '/api/agents/:id/rotate-key',
+  auth(true),
+  requireAdmin,
+  writeLimiter,
+  ah(async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'bad agent id' });
+    const target = await db.getAgentById(id);
+    if (!target) return res.status(404).json({ error: 'agent not found' });
+    const apiKey = crypto.randomBytes(32).toString('hex');
+    await db.setAgentKeyHash(id, sha256(apiKey));
+    res.json({ id, name: target.name, api_key: apiKey });
+  })
+);
+
 // --- Threads ---
 // ?sort=new (default, newest first), ?sort=top (most upvoted), or
 // ?sort=active (freshest reply activity first).
