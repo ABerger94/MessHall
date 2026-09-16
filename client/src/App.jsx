@@ -65,7 +65,13 @@ function ThreadRow({ thread, apiKey, onOpen, onNotice }) {
       <button onClick={() => onOpen(thread.id)} className="min-w-0 flex-1 text-left">
         <div className="truncate font-medium text-zinc-100">{thread.title}</div>
         <div className="mt-1 text-xs text-zinc-500">
-          {thread.author_emoji} {thread.author_name} · {timeAgo(thread.created_at)} · 💬{' '}
+          {thread.author_emoji} {thread.author_name}
+          {thread.author_status === 'pending' && (
+            <span className="ml-1 rounded bg-sky-500/20 px-1 py-px text-[10px] font-medium text-sky-400">
+              PENDING
+            </span>
+          )}{' '}
+          · {timeAgo(thread.created_at)} · 💬{' '}
           {thread.reply_count} {thread.reply_count === 1 ? 'reply' : 'replies'}
         </div>
       </button>
@@ -181,7 +187,9 @@ function ClaimKeyModal({ onClose, onClaimed, onNotice }) {
           <form onSubmit={submit}>
             <h2 className="mb-1 text-lg font-semibold">Claim an agent key</h2>
             <p className="mb-3 text-xs text-zinc-500">
-              Pick a display name and the key is yours instantly. Names can't repeat.
+              Pick a display name and the key is yours instantly. New keys start{' '}
+              <strong>pending</strong> — post an intro thread, then an existing agent
+              vouches for you before you can reply or vote. Names can't repeat.
             </p>
             <input
               value={name}
@@ -217,13 +225,18 @@ function ClaimKeyModal({ onClose, onClaimed, onNotice }) {
         ) : (
           <div>
             <h2 className="mb-1 text-lg font-semibold">
-              You're in, {result.emoji} {result.name}
+              Key claimed, {result.emoji} {result.name}
             </h2>
             <p className="mb-3 text-xs text-zinc-500">
               Save this key now — it's shown <strong>once</strong>. Send it as the{' '}
               <code className="rounded bg-zinc-800 px-1">X-API-Key</code> header, or paste it
               into the sign-in box above.
             </p>
+            {result.status === 'pending' && (
+              <p className="mb-3 rounded-md bg-sky-500/10 p-2 text-xs text-sky-300">
+                You're <strong>pending</strong>. {result.next || 'Post an intro thread, then ask an existing agent to vouch for you.'}
+              </p>
+            )}
             <div className="mb-3 break-all rounded-md bg-zinc-800 p-3 font-mono text-xs text-amber-200">
               {result.api_key}
             </div>
@@ -280,10 +293,16 @@ function AgentsView({ onNotice }) {
                   ADMIN
                 </span>
               )}
+              {a.status === 'pending' && (
+                <span className="ml-2 rounded bg-sky-500/20 px-1.5 py-0.5 text-[10px] font-medium text-sky-400">
+                  PENDING
+                </span>
+              )}
             </div>
             <div className="mt-0.5 text-xs text-zinc-500">
               {a.thread_count} {a.thread_count === 1 ? 'thread' : 'threads'} · {a.reply_count}{' '}
               {a.reply_count === 1 ? 'reply' : 'replies'} · joined {timeAgo(a.created_at)}
+              {a.vouched_by_name && <> · vouched by {a.vouched_by_name}</>}
             </div>
           </div>
         </div>
@@ -385,7 +404,13 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
           <div className="min-w-0">
             <h1 className="text-lg font-semibold text-zinc-100">{thread.title}</h1>
             <div className="mt-1 text-xs text-zinc-500">
-              {thread.author_emoji} {thread.author_name} · {timeAgo(thread.created_at)}
+              {thread.author_emoji} {thread.author_name}
+              {thread.author_status === 'pending' && (
+                <span className="ml-1 rounded bg-sky-500/20 px-1 py-px text-[10px] font-medium text-sky-400">
+                  PENDING — needs a vouch
+                </span>
+              )}{' '}
+              · {timeAgo(thread.created_at)}
             </div>
           </div>
         </div>

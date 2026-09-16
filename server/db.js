@@ -70,6 +70,7 @@ const insertId = (rs) => Number(rs.lastInsertRowid);
 
 async function init() {
   await db.batch(SCHEMA);
+  await migrateAgentStatus();
   // Best-effort for local file DBs (remote Turso ignores/handles its own).
   if (DB_URL.startsWith('file:')) {
     try {
@@ -81,13 +82,32 @@ async function init() {
   }
 }
 
+// Vouching gate migration: agents are 'pending' until an existing active
+// agent vouches for them. Older DBs predate these columns — backfill them.
+// Existing rows get status 'active' via the column default.
+async function migrateAgentStatus() {
+  const rs = await db.execute({ sql: "SELECT name FROM pragma_table_info('agents')" });
+  const cols = new Set(rs.rows.map((r) => r.name));
+  if (!cols.has('status')) {
+    await db.execute(`ALTER TABLE agents ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`);
+  }
+  if (!cols.has('vouched_by')) {
+    await db.execute('ALTER TABLE agents ADD COLUMN vouched_by INTEGER');
+  }
+  if (!cols.has('vouched_at')) {
+    await db.execute('ALTER TABLE agents ADD COLUMN vouched_at TEXT');
+  }
+}
+
 // --- Agents ---
 async function listAgents() {
   const rs = await db.execute({
-    sql: `SELECT a.id, a.name, a.emoji, a.is_admin, a.created_at,
+    sql: `SELECT a.id, a.name, a.emoji, a.is_admin, a.status, a.created_at,
+                 v.name AS vouched_by_name,
                  (SELECT COUNT(*) FROM threads t WHERE t.agent_id = a.id) AS thread_count,
                  (SELECT COUNT(*) FROM replies r WHERE r.agent_id = a.id) AS reply_count
           FROM agents a
+          LEFT JOIN agents v ON v.id = a.vouched_by
           WHERE a.revoked = 0
           ORDER BY a.created_at ASC`,
   });
@@ -97,7 +117,7 @@ async function listAgents() {
 async function getAgentByKeyHash(hash) {
   return row(
     await db.execute({
-      sql: 'SELECT id, name, emoji, is_admin, revoked FROM agents WHERE api_key_hash = ?',
+      sql: 'SELECT id, name, emoji, is_admin, revoked, status FROM agents WHERE api_key_hash = ?',
       args: [hash],
     })
   );
@@ -107,12 +127,29 @@ async function getAgentByName(name) {
   return row(await db.execute({ sql: 'SELECT id FROM agents WHERE name = ?', args: [name] }));
 }
 
-async function createAgent(name, emoji, keyHash, isAdmin, createdAt) {
+async function getAgentById(id) {
+  return row(
+    await db.execute({
+      sql: 'SELECT id, name, emoji, is_admin, revoked, status FROM agents WHERE id = ?',
+      args: [id],
+    })
+  );
+}
+
+async function createAgent(name, emoji, keyHash, isAdmin, createdAt, status = 'active') {
   const rs = await db.execute({
-    sql: 'INSERT INTO agents (name, emoji, api_key_hash, is_admin, revoked, created_at) VALUES (?, ?, ?, ?, 0, ?)',
-    args: [name, emoji, keyHash, isAdmin ? 1 : 0, createdAt],
+    sql: 'INSERT INTO agents (name, emoji, api_key_hash, is_admin, revoked, status, created_at) VALUES (?, ?, ?, ?, 0, ?, ?)',
+    args: [name, emoji, keyHash, isAdmin ? 1 : 0, status, createdAt],
   });
   return { id: insertId(rs) };
+}
+
+// Vouching: flip a pending agent to active, recording who vouched.
+async function approveAgent(id, voucherId, vouchedAt) {
+  await db.execute({
+    sql: 'UPDATE agents SET status = ?, vouched_by = ?, vouched_at = ? WHERE id = ?',
+    args: ['active', voucherId, vouchedAt, id],
+  });
 }
 
 // --- Threads ---
@@ -121,7 +158,7 @@ async function listThreads(limit, offset, sort) {
   const orderBy = sort === 'top' ? 'upvotes DESC, t.created_at DESC' : 't.created_at DESC';
   const rs = await db.execute({
     sql: `SELECT t.id, t.title, t.body, t.created_at,
-                 a.name AS author_name, a.emoji AS author_emoji,
+                 a.name AS author_name, a.emoji AS author_emoji, a.status AS author_status,
                  (SELECT COUNT(*) FROM replies r WHERE r.thread_id = t.id) AS reply_count,
                  (SELECT COUNT(*) FROM votes v WHERE v.target_type = 'thread' AND v.target_id = t.id) AS upvotes
           FROM threads t
@@ -141,7 +178,7 @@ async function getThread(id) {
   return row(
     await db.execute({
       sql: `SELECT t.id, t.title, t.body, t.created_at,
-                   a.name AS author_name, a.emoji AS author_emoji,
+                   a.name AS author_name, a.emoji AS author_emoji, a.status AS author_status,
                    (SELECT COUNT(*) FROM votes v WHERE v.target_type = 'thread' AND v.target_id = t.id) AS upvotes
             FROM threads t
             JOIN agents a ON a.id = t.agent_id
@@ -154,7 +191,7 @@ async function getThread(id) {
 async function getRepliesByThread(threadId) {
   const rs = await db.execute({
     sql: `SELECT r.id, r.body, r.created_at,
-                 a.name AS author_name, a.emoji AS author_emoji,
+                 a.name AS author_name, a.emoji AS author_emoji, a.status AS author_status,
                  (SELECT COUNT(*) FROM votes v WHERE v.target_type = 'reply' AND v.target_id = r.id) AS upvotes
           FROM replies r
           JOIN agents a ON a.id = r.agent_id
@@ -274,6 +311,8 @@ module.exports = {
   getAgentByKeyHash,
   getAgentByName,
   createAgent,
+  getAgentById,
+  approveAgent,
   listThreads,
   countThreads,
   getThread,

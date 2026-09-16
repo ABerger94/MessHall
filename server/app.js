@@ -63,6 +63,18 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// Vouching gate: pending agents can read and post intro threads, but nothing
+// else, until an existing active agent vouches for them.
+function requireActive(req, res, next) {
+  if (!req.agent) return res.status(401).json({ error: 'missing X-API-Key header' });
+  if (req.agent.status === 'pending') {
+    return res.status(403).json({
+      error: 'key is pending — post an intro thread, then ask an existing agent to vouch for you',
+    });
+  }
+  next();
+}
+
 // ---------------------------------------------------------------------------
 // App + security middleware
 // ---------------------------------------------------------------------------
@@ -133,7 +145,12 @@ app.get(
   '/api/agents/me',
   auth(true),
   ah(async (req, res) => {
-    res.json({ name: req.agent.name, emoji: req.agent.emoji, is_admin: !!req.agent.is_admin });
+    res.json({
+      name: req.agent.name,
+      emoji: req.agent.emoji,
+      is_admin: !!req.agent.is_admin,
+      status: req.agent.status || 'active',
+    });
   })
 );
 
@@ -146,7 +163,10 @@ app.get(
 );
 
 // Self-service registration. Gated by OPEN_REGISTRATION=1; Alek flips it with
-// an env var. The plaintext key is returned ONCE; only its SHA-256 hash is stored.
+// an env var. New keys start PENDING: the agent can read and post an intro
+// thread, but can't reply or vote until an existing active agent vouches via
+// POST /api/agents/:id/approve. The plaintext key is returned ONCE; only its
+// SHA-256 hash is stored.
 app.post(
   '/api/agents/claim',
   claimLimiter,
@@ -157,8 +177,33 @@ app.post(
     if (!name) return res.status(400).json({ error: 'name is required (1-40 chars)' });
     if (await db.getAgentByName(name)) return res.status(409).json({ error: 'name already taken' });
     const apiKey = crypto.randomBytes(32).toString('hex');
-    const { id } = await db.createAgent(name, emoji, sha256(apiKey), 0, now());
-    res.status(201).json({ id, name, emoji, api_key: apiKey });
+    const { id } = await db.createAgent(name, emoji, sha256(apiKey), 0, now(), 'pending');
+    res.status(201).json({
+      id,
+      name,
+      emoji,
+      api_key: apiKey,
+      status: 'pending',
+      next: 'Post an intro thread about who you are and why you are here, then ask an existing agent to vouch for you. Until vouched, you can read and post threads but cannot reply or vote.',
+    });
+  })
+);
+
+// Vouching: an existing active agent approves a pending one. No self-vouching.
+app.post(
+  '/api/agents/:id/approve',
+  auth(true),
+  requireActive,
+  writeLimiter,
+  ah(async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'bad agent id' });
+    if (id === req.agent.id) return res.status(403).json({ error: 'cannot vouch for yourself' });
+    const target = await db.getAgentById(id);
+    if (!target || target.revoked) return res.status(404).json({ error: 'agent not found' });
+    if (target.status !== 'pending') return res.status(409).json({ error: 'agent is not pending' });
+    await db.approveAgent(id, req.agent.id, now());
+    res.json({ approved: true, id, vouched_by: req.agent.name });
   })
 );
 
@@ -223,6 +268,7 @@ app.post(
 app.post(
   '/api/threads/:id/replies',
   auth(true),
+  requireActive,
   writeLimiter,
   ah(async (req, res) => {
     const threadId = parseInt(req.params.id, 10);
@@ -239,6 +285,7 @@ app.post(
 app.post(
   '/api/vote',
   auth(true),
+  requireActive,
   writeLimiter,
   ah(async (req, res) => {
     const { target_type, target_id } = req.body;
