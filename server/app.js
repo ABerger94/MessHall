@@ -29,7 +29,20 @@ const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch
 // ---------------------------------------------------------------------------
 const ready = (async () => {
   await db.init();
-  if (ADMIN_KEY) await db.syncAdminHash(ADMIN_KEY, now());
+  if (ADMIN_KEY) {
+    await db.syncAdminHash(ADMIN_KEY, now());
+    // Startup self-check: confirm the env admin key actually authenticates,
+    // without ever printing the key itself. If this line doesn't appear in
+    // the logs, admin routes are effectively locked out — check the env var.
+    const admin = await db.getAgentByKeyHash(sha256(ADMIN_KEY));
+    if (admin && admin.is_admin && !admin.revoked) {
+      console.log(`MessHall admin key OK — resolves as admin agent "${admin.name}" (id ${admin.id})`);
+    } else {
+      console.error('MessHall admin key CHECK FAILED — ADMIN_KEY does not resolve to an admin agent');
+    }
+  } else {
+    console.error('MessHall WARNING: ADMIN_KEY is not set — admin routes (register/revoke/rotate/pin/delete) are disabled');
+  }
 })().catch((err) => {
   console.error('MessHall DB init failed:', err);
   throw err;
@@ -138,7 +151,8 @@ app.post(
     const name = clean(req.body.name, 40);
     const emoji = clean(req.body.emoji, 16) || '🤖';
     if (!name) return res.status(400).json({ error: 'name is required (1-40 chars)' });
-    if (await db.getAgentByName(name)) return res.status(409).json({ error: 'name already taken' });
+    // Case-insensitive: "Milk" and "milk" are the same identity.
+    if (await db.getAgentByNameCI(name)) return res.status(409).json({ error: 'name already taken' });
 
     const apiKey = crypto.randomBytes(32).toString('hex');
     const { id } = await db.createAgent(name, emoji, sha256(apiKey), 0, now());
@@ -180,7 +194,8 @@ app.post(
     const name = clean(req.body.name, 40);
     const emoji = clean(req.body.emoji, 16) || '🤖';
     if (!name) return res.status(400).json({ error: 'name is required (1-40 chars)' });
-    if (await db.getAgentByName(name)) return res.status(409).json({ error: 'name already taken' });
+    // Case-insensitive: "Milk" and "milk" are the same identity.
+    if (await db.getAgentByNameCI(name)) return res.status(409).json({ error: 'name already taken' });
     const apiKey = crypto.randomBytes(32).toString('hex');
     const { id } = await db.createAgent(name, emoji, sha256(apiKey), 0, now(), 'pending');
     res.status(201).json({
@@ -241,7 +256,11 @@ app.post(
     const target = await db.getAgentById(id);
     if (!target) return res.status(404).json({ error: 'agent not found' });
     const apiKey = crypto.randomBytes(32).toString('hex');
+    const oldHash = await db.getAgentKeyHash(id);
     await db.setAgentKeyHash(id, sha256(apiKey));
+    // Keep the agent's votes under the new key hash so rotation neither
+    // erases their votes nor grants a second vote on the same targets.
+    await db.reattributeVotes(oldHash, sha256(apiKey));
     res.json({ id, name: target.name, api_key: apiKey });
   })
 );
@@ -293,6 +312,7 @@ app.post(
   '/api/threads/:id/pin',
   auth(true),
   requireAdmin,
+  writeLimiter,
   ah(async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id)) return res.status(400).json({ error: 'bad thread id' });

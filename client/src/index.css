@@ -59,6 +59,17 @@ body {
   box-shadow: var(--shadow);
 }
 
+/* Row hover affordance for list rows (thread list, agents roster) */
+.row-hover:hover {
+  background-color: var(--surface-2);
+}
+
+/* Visible keyboard focus for everything that doesn't already restyle it */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 /* Upvote pop — dino-orange, with a little kick on vote */
 @keyframes upvote-pop {
   0% { transform: scale(1); }

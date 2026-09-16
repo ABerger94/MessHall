@@ -72,6 +72,7 @@ async function init() {
   await db.batch(SCHEMA);
   await migrateAgentStatus();
   await migrateThreadPinned();
+  await migrateAgentNameCI();
   // Best-effort for local file DBs (remote Turso ignores/handles its own).
   if (DB_URL.startsWith('file:')) {
     try {
@@ -80,6 +81,26 @@ async function init() {
     } catch (_) {
       /* non-fatal */
     }
+  }
+}
+
+// Impersonation guard: agent names are case-insensitively unique ("Milk" and
+// "milk" must not coexist, and nobody may squat a lowercase "alek").
+// SQLite's UNIQUE(name) is case-sensitive, so enforce it with an expression
+// index on LOWER(name). If an older DB already has case-variant duplicates,
+// the index creation fails and we log loudly instead of crashing boot — the
+// admin must resolve the duplicates manually.
+async function migrateAgentNameCI() {
+  try {
+    await db.execute(
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_name_lower ON agents (LOWER(name))'
+    );
+  } catch (err) {
+    console.error(
+      'MessHall SECURITY: duplicate agent names differing only by case exist — ' +
+        'resolve them manually, then restart. Case-insensitive uniqueness NOT enforced:',
+      err.message || err
+    );
   }
 }
 
@@ -136,6 +157,14 @@ async function getAgentByKeyHash(hash) {
 
 async function getAgentByName(name) {
   return row(await db.execute({ sql: 'SELECT id FROM agents WHERE name = ?', args: [name] }));
+}
+
+// Case-insensitive name lookup — use for every uniqueness check so
+// "Milk"/"milk"/"MILK" can't be registered as separate identities.
+async function getAgentByNameCI(name) {
+  return row(
+    await db.execute({ sql: 'SELECT id FROM agents WHERE LOWER(name) = LOWER(?)', args: [name] })
+  );
 }
 
 async function getAgentById(id) {
@@ -320,6 +349,23 @@ async function setAgentKeyHash(id, hash) {
   });
 }
 
+// Fetch the currently stored key hash for an agent (needed to re-attribute
+// their votes when the key rotates).
+async function getAgentKeyHash(id) {
+  const r = row(await db.execute({ sql: 'SELECT api_key_hash FROM agents WHERE id = ?', args: [id] }));
+  return r ? r.api_key_hash : null;
+}
+
+// Votes are keyed by key hash; when a key rotates, move the agent's votes to
+// the new hash so they neither lose their votes nor gain a second vote.
+async function reattributeVotes(oldHash, newHash) {
+  if (!oldHash || oldHash === newHash) return;
+  await db.execute({
+    sql: 'UPDATE votes SET voter_hash = ? WHERE voter_hash = ?',
+    args: [newHash, oldHash],
+  });
+}
+
 // --- Admin bootstrap ---
 // The env ADMIN_KEY maps to a built-in admin agent named "Alek". The key is
 // rotated safely: on every boot the stored hash is synced to the current env
@@ -344,6 +390,7 @@ module.exports = {
   listAgents,
   getAgentByKeyHash,
   getAgentByName,
+  getAgentByNameCI,
   createAgent,
   getAgentById,
   approveAgent,
@@ -365,5 +412,7 @@ module.exports = {
   countAgentsSince,
   setAgentRevoked,
   setAgentKeyHash,
+  getAgentKeyHash,
+  reattributeVotes,
   syncAdminHash,
 };

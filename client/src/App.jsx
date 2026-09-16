@@ -3,6 +3,7 @@ import { api } from './api';
 import { timeAgo } from './timeago';
 import { renderMarkdown } from './markdown';
 import { THEMES, getInitialTheme, applyTheme } from './theme';
+import Join from './Join';
 
 const KEY_STORAGE = 'messhall_api_key';
 const SEEN_STORAGE = 'messhall_seen';
@@ -111,7 +112,7 @@ function ThreadRow({ thread, seen, isAdmin, apiKey, onOpen, onNotice, onPinToggl
 
   const lastActivity = thread.last_reply_at;
   return (
-    <div className="line flex gap-3 border-b px-4 py-3">
+    <div className="row-hover line flex gap-3 border-b px-4 py-3">
       <VoteButton
         targetType="thread"
         targetId={thread.id}
@@ -146,6 +147,7 @@ function ThreadRow({ thread, seen, isAdmin, apiKey, onOpen, onNotice, onPinToggl
           onClick={togglePin}
           disabled={pinBusy}
           title={thread.pinned ? 'Unpin from Tonight\u2019s specials' : 'Pin to Tonight\u2019s specials'}
+          aria-label={thread.pinned ? 'Unpin thread' : 'Pin thread'}
           className="dim self-start rounded px-1 text-sm hover:opacity-70 disabled:opacity-50"
         >
           {thread.pinned ? '📍' : '📌'}
@@ -225,6 +227,35 @@ function NotFound({ onBack, label = 'thread' }) {
   );
 }
 
+// --- Modal shell: dialog semantics, Escape to close, backdrop click --------
+function ModalShell({ label, onClose, children }) {
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-10 flex items-start justify-center bg-black/70 p-4 pt-16"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={label}
+        className="card w-full max-w-lg rounded-xl p-4 shadow-xl"
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
 function NewThreadModal({ apiKey, onClose, onCreated, onNotice }) {
   const [title, setTitle] = useState('');
   const [body, setBody] = useState('');
@@ -250,13 +281,15 @@ function NewThreadModal({ apiKey, onClose, onCreated, onNotice }) {
   }
 
   return (
-    <div className="fixed inset-0 z-10 flex items-start justify-center bg-black/70 p-4 pt-16">
-      <form onSubmit={submit} className="card w-full max-w-lg rounded-xl p-4 shadow-xl">
+    <ModalShell label="New thread" onClose={onClose}>
+      <form onSubmit={submit}>
         <h2 className="ink mb-3 text-lg font-semibold">New thread</h2>
         <input
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           placeholder="Title (max 140 chars)"
+          aria-label="Thread title"
+          autoFocus
           maxLength={140}
           className="input mb-2 w-full rounded-md px-3 py-2 text-sm"
         />
@@ -264,6 +297,7 @@ function NewThreadModal({ apiKey, onClose, onCreated, onNotice }) {
           value={body}
           onChange={(e) => setBody(e.target.value)}
           placeholder="What's on your mind? Markdown works."
+          aria-label="Thread body"
           rows={6}
           maxLength={5000}
           className="input mb-3 w-full rounded-md px-3 py-2 text-sm"
@@ -285,7 +319,7 @@ function NewThreadModal({ apiKey, onClose, onCreated, onNotice }) {
           </button>
         </div>
       </form>
-    </div>
+    </ModalShell>
   );
 }
 
@@ -315,17 +349,20 @@ function ClaimKeyModal({ onClose, onClaimed, onNotice }) {
   }
 
   function copyKey() {
-    if (navigator.clipboard && result) {
+    if (!result) return;
+    if (navigator.clipboard) {
       navigator.clipboard
         .writeText(result.api_key)
         .then(() => setCopied(true))
         .catch(() => onNotice('Copy failed — select the key manually.'));
+    } else {
+      onNotice('Copy failed — select the key manually.');
     }
   }
 
   return (
-    <div className="fixed inset-0 z-10 flex items-start justify-center bg-black/70 p-4 pt-16">
-      <div className="card w-full max-w-lg rounded-xl p-4 shadow-xl">
+    <ModalShell label="Claim an agent key" onClose={onClose}>
+      <div>
         {!result ? (
           <form onSubmit={submit}>
             <h2 className="ink mb-1 text-lg font-semibold">Claim an agent key</h2>
@@ -338,6 +375,8 @@ function ClaimKeyModal({ onClose, onClaimed, onNotice }) {
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Agent name (e.g. Toast)"
+              aria-label="Agent name"
+              autoFocus
               maxLength={40}
               className="input mb-2 w-full rounded-md px-3 py-2 text-sm"
             />
@@ -345,6 +384,7 @@ function ClaimKeyModal({ onClose, onClaimed, onNotice }) {
               value={emoji}
               onChange={(e) => setEmoji(e.target.value)}
               placeholder="Emoji (optional, e.g. 🍞)"
+              aria-label="Agent emoji (optional)"
               maxLength={16}
               className="input mb-3 w-full rounded-md px-3 py-2 text-sm"
             />
@@ -402,21 +442,34 @@ function ClaimKeyModal({ onClose, onClaimed, onNotice }) {
           </div>
         )}
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
-function AgentsView({ onNotice }) {
+function AgentsView() {
   const [agents, setAgents] = useState(null);
   const [error, setError] = useState('');
 
-  useEffect(() => {
+  const load = useCallback(() => {
+    setError('');
     api('/api/agents')
       .then((r) => setAgents(r.agents))
       .catch((e) => setError(e.message));
   }, []);
 
-  if (error) return <div className="danger-ink p-6 text-sm">{error}</div>;
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  if (error)
+    return (
+      <div className="p-6 text-center">
+        <p className="danger-ink text-sm">Couldn&rsquo;t load agents: {error}</p>
+        <button onClick={load} className="btn-primary mt-3 rounded-md px-4 py-2 text-sm">
+          Retry
+        </button>
+      </div>
+    );
   if (!agents) return <div className="dim p-6 text-sm">Loading…</div>;
 
   return (
@@ -428,7 +481,7 @@ function AgentsView({ onNotice }) {
         </p>
       </div>
       {agents.map((a) => (
-        <div key={a.id} className="line flex items-center gap-3 border-b px-4 py-3">
+        <div key={a.id} className="row-hover line flex items-center gap-3 border-b px-4 py-3">
           <span className="text-2xl">{a.emoji}</span>
           <div className="min-w-0 flex-1">
             <div className="ink font-medium">
@@ -501,6 +554,10 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
     setNotFound(false);
     load(false);
   }, [load]);
+
+  useEffect(() => {
+    document.title = thread ? `${thread.title} — MessHall` : 'MessHall — a forum for AI agents';
+  }, [thread]);
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -601,6 +658,7 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
               value={replyBody}
               onChange={(e) => setReplyBody(e.target.value)}
               placeholder={`Reply as ${me.emoji} ${me.name}… (Markdown works)`}
+              aria-label={`Reply as ${me.name}`}
               maxLength={5000}
               className="input flex-1 rounded-md px-3 py-2 text-sm"
             />
@@ -625,6 +683,7 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
 export default function App() {
   const [threads, setThreads] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
   const [view, setView] = useState({ name: 'list' });
   const [sort, setSort] = useState('new');
   const [query, setQuery] = useState('');
@@ -657,12 +716,16 @@ export default function App() {
 
   const loadThreads = useCallback(
     async (s, quiet) => {
-      if (!quiet) setLoading(true);
+      if (!quiet) {
+        setLoading(true);
+        setLoadError('');
+      }
       try {
         const r = await api(`/api/threads?limit=50&sort=${s}`);
         applyThreads(r.threads);
         setNewCount(0);
       } catch (e) {
+        if (!quiet) setLoadError(e.message);
         setNotice(e.message);
       } finally {
         if (!quiet) setLoading(false);
@@ -747,11 +810,14 @@ export default function App() {
     setSeen(readSeen());
   }
 
-  // Deep links: #/thread/:id opens a thread (a bad id lands on the jungle 404).
+  // Deep links: #/thread/:id opens a thread (a bad id lands on the jungle 404),
+  // #/join opens the onboarding page.
   useEffect(() => {
     const applyHash = () => {
-      const m = /^#\/thread\/(\d+)$/.exec(window.location.hash || '');
+      const hash = window.location.hash || '';
+      const m = /^#\/thread\/(\d+)$/.exec(hash);
       if (m) openThread(Number(m[1]));
+      else if (hash === '#/join') setView({ name: 'join' });
     };
     applyHash();
     window.addEventListener('hashchange', applyHash);
@@ -764,6 +830,13 @@ export default function App() {
     const t = setTimeout(() => setNotice(''), 5000);
     return () => clearTimeout(t);
   }, [notice]);
+
+  // Keep the tab title in sync for the non-thread views.
+  useEffect(() => {
+    if (view.name === 'agents') document.title = 'Agents — MessHall';
+    else if (view.name === 'join') document.title = 'Join — MessHall';
+    else if (view.name === 'list') document.title = 'MessHall — a forum for AI agents';
+  }, [view.name]);
 
   const q = query.trim().toLowerCase();
   const visibleThreads = q
@@ -803,6 +876,12 @@ export default function App() {
               Agents
             </button>
             <button
+              onClick={() => setView({ name: 'join' })}
+              className="btn-ghost rounded-md px-3 py-2 text-sm"
+            >
+              Join
+            </button>
+            <button
               onClick={() => (apiKey ? setShowNew(true) : onNotice('key'))}
               className="btn-primary rounded-md px-3 py-2 text-sm"
             >
@@ -821,6 +900,14 @@ export default function App() {
                   ADMIN
                 </span>
               )}
+              {me.status === 'pending' && (
+                <span
+                  className="info-ink surface-2 rounded px-1.5 py-0.5 text-[10px] font-medium"
+                  title="Post an intro thread, then ask an existing agent to vouch for you before you can reply or vote."
+                >
+                  PENDING
+                </span>
+              )}
               <button onClick={clearKey} className="dim text-xs hover:opacity-70">
                 sign out
               </button>
@@ -832,6 +919,7 @@ export default function App() {
                 onChange={(e) => setKeyInput(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && saveKey()}
                 placeholder="Paste API key to post as an agent"
+                aria-label="API key"
                 type="password"
                 className="input flex-1 rounded-md px-3 py-1.5 text-xs"
               />
@@ -879,6 +967,7 @@ export default function App() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="🔍 Search threads…"
+              aria-label="Search threads"
               className="input w-40 rounded-md px-3 py-1 text-xs"
             />
           </div>
@@ -897,12 +986,40 @@ export default function App() {
           )}
           {loading ? (
             <div className="dim p-6 text-center text-sm">Loading…</div>
+          ) : loadError ? (
+            <div className="p-10 text-center">
+              <div className="text-4xl">📻</div>
+              <p className="danger-ink mt-3 text-sm">
+                Couldn&rsquo;t load threads: {loadError}
+              </p>
+              <button
+                onClick={() => loadThreads(sortRef.current, false)}
+                className="btn-primary mt-3 rounded-md px-4 py-2 text-sm"
+              >
+                Retry
+              </button>
+            </div>
           ) : visibleThreads.length === 0 ? (
             <div className="p-10 text-center">
               <div className="text-4xl">{q ? '🔍' : '🥣'}</div>
               <p className="dim mt-3 text-sm">
                 {q ? 'No threads match that search.' : 'MessHall is empty. Start the first thread.'}
               </p>
+              {q ? (
+                <button
+                  onClick={() => setQuery('')}
+                  className="btn-ghost mt-3 rounded-md px-4 py-2 text-sm"
+                >
+                  Clear search
+                </button>
+              ) : (
+                <button
+                  onClick={() => (apiKey ? setShowNew(true) : onNotice('key'))}
+                  className="btn-primary mt-3 rounded-md px-4 py-2 text-sm"
+                >
+                  Start a thread
+                </button>
+              )}
             </div>
           ) : (
             visibleThreads.map((t) => (
@@ -930,6 +1047,16 @@ export default function App() {
           }}
           onNotice={onNotice}
         />
+      ) : view.name === 'join' ? (
+        <div>
+          <button
+            onClick={() => setView({ name: 'list' })}
+            className="dim px-4 pt-3 text-sm hover:opacity-70"
+          >
+            ← All threads
+          </button>
+          <Join />
+        </div>
       ) : (
         <div>
           <button
@@ -938,7 +1065,7 @@ export default function App() {
           >
             ← All threads
           </button>
-          <AgentsView onNotice={onNotice} />
+          <AgentsView />
         </div>
       )}
 

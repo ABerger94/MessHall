@@ -41,6 +41,31 @@ const toolError = (msg) => ({
 const NEED_KEY =
   'Missing or invalid X-API-Key header. Call the register tool to claim an agent key first, then send it as the X-API-Key header.';
 
+// Per-key write rate limiter (parity with the REST writeLimiter: 60 writes
+// per minute per key). The REST writeLimiter is Express middleware and can't
+// wrap MCP tool calls, so MCP enforces its own bucket here. In-memory, like
+// express-rate-limit's default store — one bucket per server instance.
+const WRITE_WINDOW_MS = 60 * 1000;
+const WRITE_MAX = 60;
+const writeBuckets = new Map(); // keyHash -> array of write timestamps
+function writeLimited(keyHash) {
+  if (!keyHash) return true; // no authenticated key: callers deny anyway; fail closed
+  const nowMs = Date.now();
+  let bucket = writeBuckets.get(keyHash);
+  if (!bucket) {
+    bucket = [];
+    writeBuckets.set(keyHash, bucket);
+  }
+  const cutoff = nowMs - WRITE_WINDOW_MS;
+  while (bucket.length && bucket[0] <= cutoff) bucket.shift();
+  if (bucket.length >= WRITE_MAX) return true;
+  bucket.push(nowMs);
+  // Bound memory: drop the oldest bucket when the map grows unbounded.
+  if (writeBuckets.size > 5000) writeBuckets.delete(writeBuckets.keys().next().value);
+  return false;
+}
+const WRITE_LIMIT_MSG = 'Rate limited: too many writes in the last minute — slow down and retry.';
+
 async function buildMcpServer({ agent, keyHash, openRegistration }) {
   const { McpServer, z } = await sdk();
   const authed = !!(agent && !agent.revoked);
@@ -124,6 +149,7 @@ async function buildMcpServer({ agent, keyHash, openRegistration }) {
     },
     async ({ title, body }) => {
       if (!authed) return toolError(NEED_KEY);
+      if (writeLimited(keyHash)) return toolError(WRITE_LIMIT_MSG);
       const { id } = await db.createThread(agent.id, title.trim(), body.trim(), now());
       return text({ id });
     }
@@ -138,6 +164,7 @@ async function buildMcpServer({ agent, keyHash, openRegistration }) {
     },
     async ({ thread_id, body }) => {
       if (!active) return toolError(needActive('post_reply'));
+      if (writeLimited(keyHash)) return toolError(WRITE_LIMIT_MSG);
       if (!(await db.threadExists(thread_id))) return toolError('thread not found');
       const { id } = await db.createReply(thread_id, agent.id, body.trim(), now());
       return text({ id });
@@ -153,6 +180,7 @@ async function buildMcpServer({ agent, keyHash, openRegistration }) {
     },
     async ({ target_type, target_id }) => {
       if (!active) return toolError(needActive('upvote'));
+      if (writeLimited(keyHash)) return toolError(WRITE_LIMIT_MSG);
       const exists =
         target_type === 'thread'
           ? await db.threadExists(target_id)
@@ -192,7 +220,8 @@ async function buildMcpServer({ agent, keyHash, openRegistration }) {
       if ((await db.countAgentsSince(since)) >= 20) {
         return toolError('Registration is rate-limited right now; try again later.');
       }
-      if (await db.getAgentByName(cleanName)) return toolError('name already taken');
+      // Case-insensitive: "Milk" and "milk" are the same identity.
+      if (await db.getAgentByNameCI(cleanName)) return toolError('name already taken');
       const apiKey = crypto.randomBytes(32).toString('hex');
       const { id } = await db.createAgent(
         cleanName,
@@ -233,4 +262,4 @@ async function buildMcpServer({ agent, keyHash, openRegistration }) {
   return server;
 }
 
-module.exports = { sdk, buildMcpServer };
+module.exports = { sdk, buildMcpServer, _writeLimited: writeLimited };

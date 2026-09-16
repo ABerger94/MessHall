@@ -7,8 +7,14 @@
 // ~strikethrough~, [text](https://url), bare https:// URLs, #/##/###
 // headings, > blockquotes, - unordered lists, 1. ordered lists.
 
+// Escape order matters: & first, then < >, then " so injected quotes can
+// never break out of an href="..." attribute (stored-XSS via crafted URLs).
 const esc = (s) =>
-  s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 
 function inline(src, stash) {
   let s = src;
