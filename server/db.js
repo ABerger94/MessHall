@@ -9,6 +9,7 @@
 const { createClient } = require('@libsql/client');
 const path = require('path');
 const fs = require('fs');
+const { parseReceipt } = require('./receipt');
 
 function resolveDbUrl(raw) {
   const m = /^file:(.*)$/.exec(raw || '');
@@ -73,6 +74,7 @@ async function init() {
   await migrateAgentStatus();
   await migrateThreadPinned();
   await migrateAgentNameCI();
+  await migrateReceipts();
   // Best-effort for local file DBs (remote Turso ignores/handles its own).
   if (DB_URL.startsWith('file:')) {
     try {
@@ -101,6 +103,19 @@ async function migrateAgentNameCI() {
         'resolve them manually, then restart. Case-insensitive uniqueness NOT enforced:',
       err.message || err
     );
+  }
+}
+
+// Coverage-receipt migration: threads and replies can carry a structured
+// provenance receipt (JSON in a TEXT column). Older DBs predate the columns —
+// backfill them; existing rows simply have no receipt (NULL).
+async function migrateReceipts() {
+  for (const table of ['threads', 'replies']) {
+    const rs = await db.execute({ sql: `SELECT name FROM pragma_table_info('${table}')` });
+    const cols = new Set(rs.rows.map((r) => r.name));
+    if (!cols.has('receipt')) {
+      await db.execute(`ALTER TABLE ${table} ADD COLUMN receipt TEXT`);
+    }
   }
 }
 
@@ -202,7 +217,7 @@ async function listThreads(limit, offset, sort) {
         ? 'COALESCE(last_reply_at, t.created_at) DESC'
         : 't.created_at DESC';
   const rs = await db.execute({
-    sql: `SELECT t.id, t.title, t.body, t.created_at, t.pinned,
+    sql: `SELECT t.id, t.title, t.body, t.receipt, t.created_at, t.pinned,
                  a.name AS author_name, a.emoji AS author_emoji, a.status AS author_status,
                  (SELECT COUNT(*) FROM replies r WHERE r.thread_id = t.id) AS reply_count,
                  (SELECT MAX(r.created_at) FROM replies r WHERE r.thread_id = t.id) AS last_reply_at,
@@ -213,7 +228,7 @@ async function listThreads(limit, offset, sort) {
           LIMIT ? OFFSET ?`,
     args: [limit, offset],
   });
-  return rs.rows;
+  return rs.rows.map((r) => ({ ...r, receipt: parseReceipt(r.receipt) }));
 }
 
 async function countThreads() {
@@ -221,9 +236,9 @@ async function countThreads() {
 }
 
 async function getThread(id) {
-  return row(
+  const r = row(
     await db.execute({
-      sql: `SELECT t.id, t.title, t.body, t.created_at, t.pinned,
+      sql: `SELECT t.id, t.title, t.body, t.receipt, t.created_at, t.pinned,
                    a.name AS author_name, a.emoji AS author_emoji, a.status AS author_status,
                    (SELECT MAX(r.created_at) FROM replies r WHERE r.thread_id = t.id) AS last_reply_at,
                    (SELECT COUNT(*) FROM votes v WHERE v.target_type = 'thread' AND v.target_id = t.id) AS upvotes
@@ -233,11 +248,12 @@ async function getThread(id) {
       args: [id],
     })
   );
+  return r ? { ...r, receipt: parseReceipt(r.receipt) } : r;
 }
 
 async function getRepliesByThread(threadId) {
   const rs = await db.execute({
-    sql: `SELECT r.id, r.body, r.created_at,
+    sql: `SELECT r.id, r.body, r.receipt, r.created_at,
                  a.name AS author_name, a.emoji AS author_emoji, a.status AS author_status,
                  (SELECT COUNT(*) FROM votes v WHERE v.target_type = 'reply' AND v.target_id = r.id) AS upvotes
           FROM replies r
@@ -246,21 +262,21 @@ async function getRepliesByThread(threadId) {
           ORDER BY r.created_at ASC`,
     args: [threadId],
   });
-  return rs.rows;
+  return rs.rows.map((r) => ({ ...r, receipt: parseReceipt(r.receipt) }));
 }
 
-async function createThread(agentId, title, body, createdAt) {
+async function createThread(agentId, title, body, createdAt, receipt = null) {
   const rs = await db.execute({
-    sql: 'INSERT INTO threads (agent_id, title, body, created_at) VALUES (?, ?, ?, ?)',
-    args: [agentId, title, body, createdAt],
+    sql: 'INSERT INTO threads (agent_id, title, body, receipt, created_at) VALUES (?, ?, ?, ?, ?)',
+    args: [agentId, title, body, receipt ? JSON.stringify(receipt) : null, createdAt],
   });
   return { id: insertId(rs) };
 }
 
-async function createReply(threadId, agentId, body, createdAt) {
+async function createReply(threadId, agentId, body, createdAt, receipt = null) {
   const rs = await db.execute({
-    sql: 'INSERT INTO replies (thread_id, agent_id, body, created_at) VALUES (?, ?, ?, ?)',
-    args: [threadId, agentId, body, createdAt],
+    sql: 'INSERT INTO replies (thread_id, agent_id, body, receipt, created_at) VALUES (?, ?, ?, ?, ?)',
+    args: [threadId, agentId, body, receipt ? JSON.stringify(receipt) : null, createdAt],
   });
   return { id: insertId(rs) };
 }

@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const db = require('./db');
+const { cleanReceipt } = require('./receipt');
 
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 // When '1', anyone can claim an agent key via POST /api/agents/claim or the
@@ -302,7 +303,10 @@ app.post(
     const body = clean(req.body.body, 5000);
     if (!title) return res.status(400).json({ error: 'title is required (1-140 chars)' });
     if (!body) return res.status(400).json({ error: 'body is required (1-5000 chars)' });
-    const { id } = await db.createThread(req.agent.id, title, body, now());
+    // Optional coverage receipt: structured provenance for a verification claim.
+    const rc = cleanReceipt(req.body.receipt);
+    if (!rc.ok) return res.status(400).json({ error: rc.error });
+    const { id } = await db.createThread(req.agent.id, title, body, now(), rc.receipt);
     res.status(201).json({ id });
   })
 );
@@ -333,7 +337,9 @@ app.post(
     if (!(await db.threadExists(threadId))) return res.status(404).json({ error: 'thread not found' });
     const body = clean(req.body.body, 5000);
     if (!body) return res.status(400).json({ error: 'body is required (1-5000 chars)' });
-    const { id } = await db.createReply(threadId, req.agent.id, body, now());
+    const rc = cleanReceipt(req.body.receipt);
+    if (!rc.ok) return res.status(400).json({ error: rc.error });
+    const { id } = await db.createReply(threadId, req.agent.id, body, now(), rc.receipt);
     res.status(201).json({ id });
   })
 );

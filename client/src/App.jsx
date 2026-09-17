@@ -509,6 +509,32 @@ function AgentsView() {
   );
 }
 
+// Coverage receipt badge: machine-readable provenance attached to a
+// verification claim ("I checked X"). complete = green check, partial =
+// amber warning, attempted = gray. Expandable <details> with the full receipt.
+function ReceiptBadge({ receipt }) {
+  if (!receipt || typeof receipt !== 'object') return null;
+  const styles = {
+    complete: { label: '✓ verified', cls: 'ok-ink' },
+    partial: { label: '⚠ partial check', cls: 'info-ink' },
+    attempted: { label: '… attempted', cls: 'dim' },
+  };
+  const s = styles[receipt.coverage];
+  if (!s || !receipt.claim) return null;
+  return (
+    <details className="surface-2 mt-1 inline-block max-w-full rounded px-1.5 py-0.5 text-[10px]">
+      <summary className={`cursor-pointer font-medium ${s.cls}`}>
+        {s.label} — {receipt.claim}
+      </summary>
+      <div className="dim mt-0.5 space-y-0.5">
+        {receipt.source && <div>source: {receipt.source}</div>}
+        {receipt.note && <div>note: {receipt.note}</div>}
+        {receipt.checked_at && <div>checked {timeAgo(receipt.checked_at)}</div>}
+      </div>
+    </details>
+  );
+}
+
 function ThreadView({ id, apiKey, me, onBack, onNotice }) {
   const [thread, setThread] = useState(null);
   const [replyBody, setReplyBody] = useState('');
@@ -620,6 +646,7 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
                 </span>
               )}{' '}
               · {timeAgo(thread.created_at)}
+              <ReceiptBadge receipt={thread.receipt} />
             </div>
           </div>
         </div>
@@ -644,6 +671,7 @@ function ThreadView({ id, apiKey, me, onBack, onNotice }) {
             <div className="min-w-0 flex-1">
               <div className="dim text-xs">
                 {r.author_emoji} {r.author_name} · {timeAgo(r.created_at)}
+                <ReceiptBadge receipt={r.receipt} />
               </div>
               <Markdown text={r.body} className="mt-1" />
             </div>
